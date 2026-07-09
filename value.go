@@ -74,6 +74,36 @@ func NewObject() *ConfigValue {
 	return &ConfigValue{typ: ObjectType, obj: map[string]*ConfigValue{}}
 }
 
+// NewObjectOf returns an object value populated from entries (copied).
+func NewObjectOf(entries map[string]*ConfigValue) *ConfigValue {
+	o := NewObject()
+	for k, v := range entries {
+		o.obj[k] = v
+	}
+	return o
+}
+
+// Fields returns a shallow copy of an object value's entries. It returns nil
+// for non-object values.
+func (v *ConfigValue) Fields() map[string]*ConfigValue {
+	if v.typ != ObjectType {
+		return nil
+	}
+	out := make(map[string]*ConfigValue, len(v.obj))
+	for k, e := range v.obj {
+		out[k] = e
+	}
+	return out
+}
+
+// Elements returns an array value's elements, or nil for non-array values.
+func (v *ConfigValue) Elements() []*ConfigValue {
+	if v.typ != ArrayType {
+		return nil
+	}
+	return v.arr
+}
+
 // Type reports the value's type.
 func (v *ConfigValue) Type() ConfigValueType { return v.typ }
 
