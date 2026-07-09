@@ -143,12 +143,18 @@ func TestDefaultIncludeFromDisk(t *testing.T) {
 	if err := os.WriteFile(path, []byte("disk = 7"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	c := mustParse(t, `include file("`+path+`")`, WithEnv(noEnv))
+	// Forward slashes work on every OS and avoid backslash escaping when the
+	// path is embedded inside a quoted HOCON string (Windows temp paths).
+	slash := filepath.ToSlash(path)
+	c := mustParse(t, `include file("`+slash+`")`, WithEnv(noEnv))
 	if v, _ := c.GetInt("disk"); v != 7 {
 		t.Errorf("disk = %d", v)
 	}
-	// missing file
-	wantErr(t, `include file("`+filepath.Join(dir, "nope.conf")+`")`, "no such file")
+	// missing file (error message is OS-specific, so only require an error)
+	missing := filepath.ToSlash(filepath.Join(dir, "nope.conf"))
+	if _, err := Parse(`include file("`+missing+`")`, WithEnv(noEnv)); err == nil {
+		t.Error("expected error for missing include file")
+	}
 	// unsupported kind for default resolver
 	wantErr(t, `include url("http://x")`, "require a custom resolver")
 }
