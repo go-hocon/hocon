@@ -26,6 +26,7 @@ const (
 	tString
 	tSubst
 	tUnquoted
+	tReserved // a character reserved by the spec that may not start a value/key
 )
 
 type token struct {
@@ -70,9 +71,22 @@ func (l *lexer) advance() byte {
 	return c
 }
 
+// isReserved reports whether c is a HOCON "forbidden character" that carries no
+// structural meaning of its own: it may neither appear inside an unquoted string
+// nor begin a value or key. Per the spec these are reserved for future use.
+func isReserved(c byte) bool {
+	switch c {
+	case '`', '^', '?', '!', '@', '*', '&', '\\':
+		return true
+	default:
+		return false
+	}
+}
+
 func isUnquotedStop(c, next byte) bool {
 	switch c {
-	case ' ', '\t', '\r', '\n', '$', '"', '{', '}', '[', ']', ':', '=', ',', '+', '#':
+	case ' ', '\t', '\r', '\n', '$', '"', '{', '}', '[', ']', ':', '=', ',', '+', '#',
+		'`', '^', '?', '!', '@', '*', '&', '\\':
 		return true
 	case '/':
 		return next == '/'
@@ -106,11 +120,15 @@ func (l *lexer) next() (token, error) {
 		c := l.cur()
 		switch {
 		case c == ' ' || c == '\t' || c == '\r':
-			l.advance()
+			var ws strings.Builder
+			ws.WriteByte(l.advance())
 			for !l.eof() && (l.cur() == ' ' || l.cur() == '\t' || l.cur() == '\r') {
-				l.advance()
+				ws.WriteByte(l.advance())
 			}
-			return token{kind: tWS, text: " ", line: line, col: col}, nil
+			// The HOCON spec requires whitespace *between* simple values in a
+			// value (or path) concatenation to be preserved verbatim, so the
+			// token carries the exact run rather than a single space.
+			return token{kind: tWS, text: ws.String(), line: line, col: col}, nil
 		case c == '\n':
 			l.advance()
 			return token{kind: tNL, line: line, col: col}, nil
@@ -147,11 +165,16 @@ func (l *lexer) next() (token, error) {
 				l.advance()
 				return token{kind: tPlusEq, line: line, col: col}, nil
 			}
-			return l.lexUnquoted()
+			// A lone '+' is a forbidden character, not the start of a value.
+			l.advance()
+			return token{kind: tReserved, text: "+", line: line, col: col}, nil
 		case c == '"':
 			return l.lexString()
 		case c == '$':
 			return l.lexSubst()
+		case isReserved(c):
+			l.advance()
+			return token{kind: tReserved, text: string(c), line: line, col: col}, nil
 		default:
 			return l.lexUnquoted()
 		}

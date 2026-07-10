@@ -4,7 +4,11 @@
 
 package hocon
 
-import "strings"
+import (
+	"errors"
+	"io/fs"
+	"strings"
+)
 
 // parser turns a token stream into a merged [astObject].
 type parser struct {
@@ -155,33 +159,63 @@ func (p *parser) parseField(o *astObject) error {
 	}
 }
 
-// parseKey reads a (possibly dotted) key up to the separator.
+// parseKey reads a (possibly dotted) key up to the separator. A key is a path
+// expression that works like a value concatenation: unquoted and quoted string
+// tokens joined with their intervening whitespace. Whitespace *inside* a path
+// element is preserved verbatim (so `valid hocon` and `a b  c` are single keys);
+// leading and trailing whitespace, and whitespace surrounding a `.` separator,
+// is discarded. Dots that appear unquoted split the key into path segments.
 func (p *parser) parseKey() ([]string, token, error) {
 	first := p.tok()
 	var segs []string
-	cur := ""
-	started := false
+	var cur strings.Builder
+	segStarted := false // the current segment has at least one non-ws char
+	started := false    // at least one key token has been seen
+	pendingWS := ""     // whitespace awaiting a following same-segment token
+
+	flush := func() {
+		segs = append(segs, cur.String())
+		cur.Reset()
+		segStarted = false
+		pendingWS = ""
+	}
+	appendPart := func(part string) {
+		if segStarted && pendingWS != "" {
+			cur.WriteString(pendingWS)
+		}
+		cur.WriteString(part)
+		segStarted = true
+		pendingWS = ""
+	}
+
 	for {
 		t := p.tok()
 		switch t.kind {
 		case tUnquoted:
 			started = true
 			parts := strings.Split(t.text, ".")
-			cur += parts[0]
-			for _, extra := range parts[1:] {
-				segs = append(segs, cur)
-				cur = extra
+			for i, part := range parts {
+				if i > 0 {
+					flush() // a dot ends the current segment (trailing ws dropped)
+				}
+				if part == "" {
+					continue
+				}
+				appendPart(part)
 			}
 			p.advance()
 		case tString:
 			started = true
-			cur += t.text
+			appendPart(t.text)
+			p.advance()
+		case tWS:
+			pendingWS = t.text
 			p.advance()
 		default:
 			if !started {
 				return nil, first, p.errAt(t, "expected a key")
 			}
-			segs = append(segs, cur)
+			flush()
 			for _, s := range segs {
 				if s == "" {
 					return nil, first, p.errAt(first, "empty key segment")
@@ -194,13 +228,26 @@ func (p *parser) parseKey() ([]string, token, error) {
 
 func (p *parser) parseInclude(o *astObject) error {
 	p.skipWS()
-	kind, name, err := p.parseIncludeTarget()
+	directiveTok := p.tok()
+	kind, name, required, err := p.parseIncludeTarget()
 	if err != nil {
 		return err
 	}
 	content, err := p.include(kind, name)
 	if err != nil {
-		return &ParseError{Msg: "include " + kind + "(" + name + "): " + err.Error()}
+		// A missing resource is silently ignored for a plain include; a
+		// required() include instead fails. Any other resolver error is fatal
+		// regardless of required(). "Missing" is signalled by fs.ErrNotExist
+		// (the default file resolver) or the exported ErrIncludeNotFound seam.
+		missing := errors.Is(err, fs.ErrNotExist) || errors.Is(err, ErrIncludeNotFound)
+		switch {
+		case missing && required:
+			return p.errAt(directiveTok, "required include "+kind+"("+name+") could not be resolved: "+err.Error())
+		case missing:
+			return nil
+		default:
+			return &ParseError{Msg: "include " + kind + "(" + name + "): " + err.Error(), Line: directiveTok.line, Col: directiveTok.col}
+		}
 	}
 	toks, err := lex(content)
 	if err != nil {
@@ -211,43 +258,84 @@ func (p *parser) parseInclude(o *astObject) error {
 	if err != nil {
 		return err
 	}
+	// An included document must be an object, not an array (a top-level array
+	// is stored under the empty key by parseRoot).
+	if _, isArray := inc.fields[""]; isArray {
+		return p.errAt(directiveTok, "included resource "+kind+"("+name+") must contain an object, not an array")
+	}
 	o.mergeFrom(inc)
 	return nil
 }
 
-// parseIncludeTarget reads `"file.conf"` (bare, treated as a file) or
-// `kind("...")` where kind is one of file, url or classpath. Because the lexer
-// keeps '(' and ')' inside unquoted runs, the qualifier arrives as `kind(` and
-// the closing paren as a `)` token after the quoted string.
-func (p *parser) parseIncludeTarget() (kind, name string, err error) {
+// parseIncludeTarget reads an include argument: a bare `"file.conf"` (treated
+// as a file heuristic), or a qualifier form `file("...")`, `url("...")`,
+// `classpath("...")`, or any of those wrapped in `required(...)` (which makes a
+// missing resource an error rather than a silent skip). Because the lexer keeps
+// '(' and ')' inside unquoted runs (they are legal unquoted-string characters),
+// the qualifier prefix arrives as one or more `qualifier(` tokens — packed
+// together (`required(file(`) or separated by whitespace (`required( file(`) —
+// and the closing parens arrive as a run of `)` after the quoted string.
+func (p *parser) parseIncludeTarget() (kind, name string, required bool, err error) {
 	t := p.tok()
-	if t.kind == tString {
+	if t.kind == tString { // bare quoted string: heuristic file include
 		p.advance()
-		return "file", t.text, nil
+		return "file", t.text, false, nil
 	}
 	if t.kind != tUnquoted || !strings.HasSuffix(t.text, "(") {
-		return "", "", p.errAt(t, "expected include target")
+		return "", "", false, p.errAt(t, "expected include target")
 	}
-	kind = strings.TrimSuffix(t.text, "(")
-	switch kind {
-	case "file", "url", "classpath":
-	case "required":
-		return "", "", p.errAt(t, "required(...) includes are not supported")
-	default:
-		return "", "", p.errAt(t, "unknown include qualifier "+kind)
+	// Collect the opener qualifiers, which may span several whitespace-separated
+	// unquoted tokens; each token is a run of `qualifier(` fragments.
+	kind = "file" // heuristic default when only required(...) wraps a string
+	opens := 0
+	for {
+		cur := p.tok()
+		if cur.kind != tUnquoted || !strings.HasSuffix(cur.text, "(") {
+			break
+		}
+		for _, q := range strings.Split(strings.TrimSuffix(cur.text, "("), "(") {
+			switch q {
+			case "required":
+				if opens != 0 {
+					return "", "", false, p.errAt(cur, "required(...) must be the outermost include qualifier")
+				}
+				required = true
+			case "file", "url", "classpath":
+				kind = q
+			default:
+				return "", "", false, p.errAt(cur, "unknown include qualifier "+q)
+			}
+			opens++
+		}
+		p.advance()
+		p.skipWS()
 	}
-	p.advance()
 	st := p.tok()
 	if st.kind != tString {
-		return "", "", p.errAt(st, "expected quoted string in "+kind+"(...)")
+		return "", "", false, p.errAt(st, "expected quoted string in include qualifier")
 	}
 	p.advance()
-	ct := p.tok()
-	if ct.kind != tUnquoted || !strings.HasPrefix(ct.text, ")") {
-		return "", "", p.errAt(ct, "expected ')' after include target")
+	// Consume exactly `opens` closing parens, which may be spread across tokens
+	// and separated by whitespace, e.g. `) )` or a single `))`.
+	closes := 0
+	for closes < opens {
+		p.skipWS()
+		ct := p.tok()
+		if ct.kind != tUnquoted {
+			return "", "", false, p.errAt(ct, "expected ')' after include target")
+		}
+		for _, ch := range ct.text {
+			if ch != ')' {
+				return "", "", false, p.errAt(ct, "expected ')' after include target")
+			}
+			closes++
+		}
+		p.advance()
+		if closes > opens {
+			return "", "", false, p.errAt(ct, "unbalanced ')' in include target")
+		}
 	}
-	p.advance()
-	return kind, st.text, nil
+	return kind, st.text, required, nil
 }
 
 // parseValue parses a value concatenation up to a field terminator.
@@ -265,7 +353,7 @@ func (p *parser) parseValue() (*astValue, error) {
 			}
 			return v, nil
 		case tWS:
-			pendingWS = " "
+			pendingWS = t.text // preserved verbatim for string concatenation
 			p.advance()
 			continue
 		case tLBrace:

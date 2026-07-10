@@ -60,7 +60,7 @@ func (r *resolver) resolveValue(v *astValue) (*ConfigValue, error) {
 		}
 		return parts[0].cv, nil
 	default:
-		return combine(parts), nil
+		return combine(parts)
 	}
 }
 
@@ -134,31 +134,38 @@ func interpretScalar(raw string) *ConfigValue {
 	return NewString(raw)
 }
 
-// combine folds multiple concatenation parts: all-object -> deep merge,
-// all-array -> concat, otherwise -> whitespace-preserving string concatenation.
-func combine(parts []resolvedElem) *ConfigValue {
-	allObj, allArr := true, true
+// combine folds multiple concatenation parts. Per the HOCON spec, objects
+// concatenate with objects (deep merge) and arrays with arrays (concatenation),
+// but mixing an object or array with anything else is an error; otherwise the
+// parts are simple values that string-concatenate, preserving the whitespace
+// between them verbatim.
+func combine(parts []resolvedElem) (*ConfigValue, error) {
+	anyObj, anyArr, anyScalar := false, false, false
 	for _, p := range parts {
-		if p.cv.typ != ObjectType {
-			allObj = false
-		}
-		if p.cv.typ != ArrayType {
-			allArr = false
+		switch p.cv.typ {
+		case ObjectType:
+			anyObj = true
+		case ArrayType:
+			anyArr = true
+		default:
+			anyScalar = true
 		}
 	}
 	switch {
-	case allObj:
+	case anyObj && !anyArr && !anyScalar:
 		out := NewObject()
 		for _, p := range parts {
 			mergeInto(out, p.cv)
 		}
-		return out
-	case allArr:
+		return out, nil
+	case anyArr && !anyObj && !anyScalar:
 		out := NewArray()
 		for _, p := range parts {
 			out.arr = append(out.arr, p.cv.arr...)
 		}
-		return out
+		return out, nil
+	case anyObj || anyArr:
+		return nil, &ResolveError{Msg: "cannot concatenate an object or list with a non-object-or-list value"}
 	default:
 		var b strings.Builder
 		for i, p := range parts {
@@ -167,6 +174,6 @@ func combine(parts []resolvedElem) *ConfigValue {
 			}
 			b.WriteString(p.cv.scalarString())
 		}
-		return NewString(b.String())
+		return NewString(b.String()), nil
 	}
 }

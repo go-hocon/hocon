@@ -16,6 +16,13 @@ var ErrMissing = errors.New("path not found")
 // exists but is not of the requested type.
 var ErrWrongType = errors.New("wrong value type")
 
+// ErrIncludeNotFound may be returned by an [IncludeResolver] to signal that the
+// requested resource does not exist. A plain `include` treats a not-found
+// resource as an empty object (silently skipped); an `include required(...)`
+// turns it into a parse error. Resolvers built on the filesystem can also just
+// return an fs.ErrNotExist-wrapped error, which is recognised identically.
+var ErrIncludeNotFound = errors.New("include resource not found")
+
 // ParseError describes a lexical or syntactic failure, with 1-based position.
 type ParseError struct {
 	Msg  string
