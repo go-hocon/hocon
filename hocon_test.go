@@ -141,13 +141,18 @@ func TestNestedObjectDeepMerge(t *testing.T) {
 	}
 }
 
-func TestUnquotedSlashAndPlus(t *testing.T) {
-	c := mustParse(t, "path = foo/bar/baz\nn = +5")
+func TestUnquotedSlashAndParens(t *testing.T) {
+	// A single '/' and parentheses are legal in unquoted strings; a negative
+	// number leads with '-' (a JSON number start), which is also fine.
+	c := mustParse(t, "path = foo/bar/baz\nn = -5\ncall = foo(bar)")
 	if v, _ := c.GetString("path"); v != "foo/bar/baz" {
 		t.Errorf("path = %q", v)
 	}
-	if v, _ := c.GetInt("n"); v != 5 {
+	if v, _ := c.GetInt("n"); v != -5 {
 		t.Errorf("n = %d", v)
+	}
+	if v, _ := c.GetString("call"); v != "foo(bar)" {
+		t.Errorf("call = %q", v)
 	}
 }
 
@@ -192,8 +197,11 @@ func TestArrayWithOptionalHole(t *testing.T) {
 }
 
 func TestValueConcatString(t *testing.T) {
-	c := mustParse(t, `a = the quick   brown fox`)
-	if v, _ := c.GetString("a"); v != "the quick brown fox" {
+	// The HOCON spec requires whitespace between simple values to be preserved
+	// verbatim (the reference Typesafe Config and ruby hocon both keep the three
+	// spaces), and leading/trailing whitespace to be trimmed.
+	c := mustParse(t, `a =   the quick   brown fox  `)
+	if v, _ := c.GetString("a"); v != "the quick   brown fox" {
 		t.Errorf("a = %q", v)
 	}
 }

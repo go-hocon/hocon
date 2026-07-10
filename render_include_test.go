@@ -123,10 +123,70 @@ func TestIncludeErrors(t *testing.T) {
 	// malformed directives
 	wantErr(t, `include foo`, "expected include target")
 	wantErr(t, `include {`, "expected include target")
-	wantErr(t, `include required("x")`, "required(...) includes are not supported")
 	wantErr(t, `include bogus(`, "unknown include qualifier")
 	wantErr(t, `include file(`, "expected quoted string")
 	wantErr(t, "include file(\"x\"", "expected ')'")
+	// A required() include whose resource cannot be resolved is a hard error
+	// (whereas a plain include silently skips a missing resource).
+	notFound := func(kind, name string) (string, error) { return "", ErrIncludeNotFound }
+	wantErr(t, `include required("x.conf")`, "required include", WithIncludeResolver(notFound))
+	wantErr(t, `include required(file("x.conf"))`, "could not be resolved", WithIncludeResolver(notFound))
+	wantErr(t, `include required(url("http://x"))`, "required include", WithIncludeResolver(notFound))
+	// required(...) may only wrap the other qualifiers, not the reverse.
+	wantErr(t, `include file(required("x"))`, "outermost", WithIncludeResolver(notFound))
+	// A non-not-found resolver error is fatal even for a plain include.
+	wantErr(t, `include file("x.conf")`, "boom", WithIncludeResolver(func(kind, name string) (string, error) {
+		return "", errors.New("boom")
+	}))
+	// An included document must be an object, not a top-level array.
+	arrInc := func(kind, name string) (string, error) { return `[1, 2, 3]`, nil }
+	wantErr(t, `include file("x.conf")`, "must contain an object", WithIncludeResolver(arrInc))
+	// Unbalanced closing parens are rejected.
+	wantErr(t, `include file("x"))`, "unbalanced", WithIncludeResolver(func(kind, name string) (string, error) {
+		return "", nil
+	}))
+	// Trailing junk after the closing paren (a non-')' char in the run).
+	wantErr(t, `include file("x")junk`, "expected ')'")
+}
+
+func TestIncludeRequired(t *testing.T) {
+	resolver := func(kind, name string) (string, error) {
+		if name == "present.conf" {
+			return "ok = 1", nil
+		}
+		return "", ErrIncludeNotFound
+	}
+	// required() resource that resolves is merged normally.
+	c := mustParse(t, `include required(file("present.conf"))`, WithIncludeResolver(resolver), WithEnv(noEnv))
+	if v, _ := c.GetInt("ok"); v != 1 {
+		t.Errorf("ok = %d", v)
+	}
+	// required() around a bare quoted string (heuristic file) also works.
+	c2 := mustParse(t, `include required("present.conf")`, WithIncludeResolver(resolver), WithEnv(noEnv))
+	if v, _ := c2.GetInt("ok"); v != 1 {
+		t.Errorf("ok = %d", v)
+	}
+	// Whitespace inside the parentheses is allowed.
+	c3 := mustParse(t, `include required( file( "present.conf" ) )`, WithIncludeResolver(resolver), WithEnv(noEnv))
+	if v, _ := c3.GetInt("ok"); v != 1 {
+		t.Errorf("ok = %d", v)
+	}
+}
+
+func TestIncludeOptionalMissingSkipped(t *testing.T) {
+	// A plain include whose resource is not found is silently ignored, leaving
+	// the surrounding fields intact (HOCON spec: as if it were an empty object).
+	notFound := func(kind, name string) (string, error) { return "", ErrIncludeNotFound }
+	c := mustParse(t, "a = 1\ninclude file(\"missing.conf\")\nb = 2", WithIncludeResolver(notFound), WithEnv(noEnv))
+	if v, _ := c.GetInt("a"); v != 1 {
+		t.Errorf("a = %d", v)
+	}
+	if v, _ := c.GetInt("b"); v != 2 {
+		t.Errorf("b = %d", v)
+	}
+	if c.HasPath("missing") {
+		t.Error("no spurious key from skipped include")
+	}
 }
 
 func TestIncludeReservedAsKey(t *testing.T) {
@@ -150,12 +210,20 @@ func TestDefaultIncludeFromDisk(t *testing.T) {
 	if v, _ := c.GetInt("disk"); v != 7 {
 		t.Errorf("disk = %d", v)
 	}
-	// missing file (error message is OS-specific, so only require an error)
+	// A missing plain include from disk is silently skipped (the default file
+	// resolver returns an fs.ErrNotExist-wrapped error, treated as not-found).
 	missing := filepath.ToSlash(filepath.Join(dir, "nope.conf"))
-	if _, err := Parse(`include file("`+missing+`")`, WithEnv(noEnv)); err == nil {
-		t.Error("expected error for missing include file")
+	c2, err := Parse("k = 1\ninclude file(\""+missing+"\")", WithEnv(noEnv))
+	if err != nil {
+		t.Errorf("missing plain include should be skipped, got: %v", err)
+	} else if v, _ := c2.GetInt("k"); v != 1 {
+		t.Errorf("k = %d after skipped include", v)
 	}
-	// unsupported kind for default resolver
+	// The same file under required() is a hard error.
+	if _, err := Parse(`include required(file("`+missing+`"))`, WithEnv(noEnv)); err == nil {
+		t.Error("expected error for missing required include file")
+	}
+	// unsupported kind for default resolver (non-not-found error is fatal)
 	wantErr(t, `include url("http://x")`, "require a custom resolver")
 }
 

@@ -22,10 +22,28 @@ func (c *Config) Root() *ConfigValue { return c.root }
 // splitPath breaks a dotted path into segments.
 func splitPath(path string) []string { return strings.Split(path, ".") }
 
-// GetValue returns the [ConfigValue] at a dotted path.
+// GetValue returns the [ConfigValue] at a dotted path. Each `.` in path starts
+// a new object level, so `GetValue("a.b")` descends into object `a` then key
+// `b`. A key that itself contains a literal dot — written quoted in HOCON, e.g.
+// `"a.b" = 1` — cannot be reached this way; use [Config.GetValuePath] with the
+// key as a single explicit segment (`GetValuePath("a.b")`).
 func (c *Config) GetValue(path string) (*ConfigValue, error) {
+	return c.getSegments(splitPath(path), path)
+}
+
+// GetValuePath returns the [ConfigValue] at a path given as explicit segments,
+// bypassing dotted-path parsing. This is how literal-dot keys are addressed:
+// for `"a.b" = 1`, GetValuePath("a.b") returns 1, whereas GetValue("a.b") looks
+// for a nested object `a` with key `b`. Passing several segments descends the
+// tree segment by segment (GetValuePath("a", "b") == GetValue("a.b")).
+func (c *Config) GetValuePath(segments ...string) (*ConfigValue, error) {
+	return c.getSegments(segments, strings.Join(segments, "."))
+}
+
+// getSegments walks the object tree following the given segments verbatim.
+func (c *Config) getSegments(segments []string, path string) (*ConfigValue, error) {
 	cur := c.root
-	for _, seg := range splitPath(path) {
+	for _, seg := range segments {
 		if cur.typ != ObjectType {
 			return nil, &PathError{Path: path, Err: ErrMissing}
 		}
@@ -38,9 +56,16 @@ func (c *Config) GetValue(path string) (*ConfigValue, error) {
 	return cur, nil
 }
 
-// HasPath reports whether a value exists at the path.
+// HasPath reports whether a value exists at the dotted path.
 func (c *Config) HasPath(path string) bool {
 	_, err := c.GetValue(path)
+	return err == nil
+}
+
+// HasPathSegments reports whether a value exists at the given explicit path
+// segments (the segmented analogue of [Config.HasPath]).
+func (c *Config) HasPathSegments(segments ...string) bool {
+	_, err := c.GetValuePath(segments...)
 	return err == nil
 }
 
